@@ -1,0 +1,9 @@
+book
+
+# ides
+.idea
+.vscode
+
+#firebase
+.firebase
+.firebaserc
