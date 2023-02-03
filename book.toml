@@ -1,5 +1,10 @@
 [book]
-authors = ["Dharmit Shah"]
+title = "Learning system calls by examples"
+author = "Dharmit Shah"
 language = "en"
 multilingual = false
 src = "src"
+
+[output.html]
+default-theme = "ayu"
+preferred-dark-theme = "ayu"
