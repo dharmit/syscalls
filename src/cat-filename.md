@@ -4,14 +4,13 @@ Create a file and `strace` the `cat` command that shows its contents:
 
 ```shell
 $ echo "Hello, world" > filename
+$ cat filename
+Hello, world
 ```
 
 Now the `strace`:
 <!-- TODO: figure out how to fold strace output -->
 ```shell
-$ cat filename
-Hello, world
-
 $ strace cat filename
 execve("/usr/bin/cat", ["cat", "filename"], 0x7ffe36b26958 /* 62 vars */) = 0
 brk(NULL)                               = 0x5651e8f08000
@@ -71,7 +70,7 @@ Let's start from the first line in the `strace` output and go all the way to the
 
 ### `execve()` 
 
-Call: `execve("/usr/bin/cat", ["cat", "filename"], 0x7ffe36b26958 /* 62 vars */) = 0`
+`execve("/usr/bin/cat", ["cat", "filename"], 0x7ffe36b26958 /* 62 vars */) = 0`
 
 From the man page (`man 2 execve`), `execve` stands for "execute program", and here's the function's signature (from 
 man page's `SYNOPSIS` section):
@@ -117,7 +116,7 @@ $ env | wc -l
 
 ### `brk()`
 
-Call: `brk(NULL)                               = 0x5651e8f08000`
+`brk(NULL)                               = 0x5651e8f08000`
 
 This one took some time to wrap my head around. It was
 [this answer on stackexchange](https://unix.stackexchange.com/a/464985/4335) that helped me understand it. Few 
@@ -132,14 +131,14 @@ This system call is usually called right before `malloc()` or another call that 
 
 ### `arch_prctl()`
 
-Call: `arch_prctl(0x3001 /* ARCH_??? */, 0x7ffd8d760bf0) = -1 EINVAL (Invalid argument)`
+`arch_prctl(0x3001 /* ARCH_??? */, 0x7ffd8d760bf0) = -1 EINVAL (Invalid argument)`
 
 This is an erroneous call which can be deduced from the return value of `-1`. The `EINVAL` error indicates that the 
 value for the argument `code` is the one that is invalid.
 
 ### `mmap()`
 
-Call:`mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f390c25a000`
+`mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f390c25a000`
 
 It took me some time to understand `mmap`. From the first statement of its man page (`mmap, munmap - map or unmap 
 files or devices into memory`) I thought it copies the file contents to the memory. But that's not the case.
@@ -157,3 +156,32 @@ by 8192 bytes.
 Some useful links for mmap - [1](https://sasha-f.medium.com/why-mmap-is-faster-than-system-calls-24718e75ab37),
 [2](https://stackoverflow.com/questions/1739296/malloc-vs-mmap-in-c),
 [3](https://unix.stackexchange.com/questions/389124/understanding-mmap). Phew!
+
+### `access`
+
+`access("/etc/ld.so.preload", R_OK)      = -1 ENOENT (No such file or directory)`
+
+Yet another erroneous call. `access()` checks if the calling process can access the filename with the specified mode.
+The first argument is the filename and second one is the mode. Here the file `/etc/ld.so.preload` doesn't exist on 
+my system. `R_OK` indicates read permissions.
+
+My curiosity led me to find more about `/etc/ld.so.preload`. First I did, `dnf provides` but it exited saying "No 
+packages found". Next, I went to the search engine which yielded Q&A across stackechange sites. Attempting 
+to open `/etc/ld.so.preload` is a behaviour all programs exhibit; it's something that's baked into glibc. Beyond 
+that the topic of "preloading" seemed like a rabbit hole that I don't want to dive into at the moment.
+
+### openat()
+
+`openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3`
+
+Signature of `openat` from the man page: `int openat(int dirfd, const char *pathname, int flags)`.
+
+Here, `/etc/ld.so.cache` file is being opened with the bitwise OR result of the flags (access modes) `O_RDONLY` 
+(read-only) and `O_CLOEXEC` (enable close-on-exec for the file descriptor). The `AT_FDCWD` parameter is ignored here 
+because the filename is provided as an absolute path, not relative path. The returned value `3` is a file descriptor.
+This file descriptor is a small, non-negative integer that is an index to an entry in the process's table of open 
+file descriptors. That's a mouthful!
+
+You might notice that `/etc/ld.so.cache` is a binary file. To read its contents, use `ldconfig -p`. Its contents are 
+list of directories in which the dynamic linker would search for shared objects. Like with `access()` above, I'm 
+avoiding diving into the topic of dynamic linker at the moment. Not sure how long I can keep putting it off.
