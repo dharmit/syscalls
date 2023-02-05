@@ -140,8 +140,11 @@ value for the argument `code` is the one that is invalid.
 
 `mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f390c25a000`
 
-It took me some time to understand `mmap`. From the first statement of its man page (`mmap, munmap - map or unmap 
-files or devices into memory`) I thought it copies the file contents to the memory. But that's not the case.
+It took me some time to understand `mmap`. From the first statement of its man page:
+```shell
+mmap, munmap - map or unmap files or devices into memory
+```
+I thought it copies the file contents to the memory. But that's not the case.
 
 In this particular call, `mmap` function creates a new mapping of the size 8192 
 [bytes](https://www.geeksforgeeks.org/size_t-data-type-c-language/) in the virtual address space of the calling 
@@ -149,10 +152,12 @@ process. The calling process here is `cat`.
 
 Using `mmap` doesn't actually read the file, but creates a mapping in the memory of the size of the file. However, 
 in this particular case, the value for `fd` (file descriptor) is -1. The value for the flags is bitwise OR of 
-`MAP_PRIVATE` and `MAP_ANONYMOUS`. It took me hours reading various answers and blogs on the Internet, but my 
-understanding is that this call is meant to [increase the heap memory](https://stackoverflow.com/a/39903701/395670) 
-by 8192 bytes.
+`MAP_PRIVATE` and `MAP_ANONYMOUS`. It took me hours reading various answers and blogs on the Internet, and my final
+understanding is that this particular call is meant to 
+[increase the heap memory](https://stackoverflow.com/a/39903701/395670) by 8192 bytes. The return value 
+`0x7f390c25a000` is the pointer in the virtual memory to the area where this heap memory was created.
 
+There are more calls to `mmap` in the output we're walking through, and I expect them to be doing different things. 
 Some useful links for mmap - [1](https://sasha-f.medium.com/why-mmap-is-faster-than-system-calls-24718e75ab37),
 [2](https://stackoverflow.com/questions/1739296/malloc-vs-mmap-in-c),
 [3](https://unix.stackexchange.com/questions/389124/understanding-mmap). Phew!
@@ -172,6 +177,7 @@ that the topic of "preloading" seemed like a rabbit hole that I don't want to di
 
 ### openat()
 
+<!-- Why does `cat` need to read `/etc/ld.so.cache` file> -->
 `openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3`
 
 Signature of `openat` from the man page: `int openat(int dirfd, const char *pathname, int flags)`.
@@ -185,3 +191,79 @@ file descriptors. That's a mouthful!
 You might notice that `/etc/ld.so.cache` is a binary file. To read its contents, use `ldconfig -p`. Its contents are 
 list of directories in which the dynamic linker would search for shared objects. Like with `access()` above, I'm 
 avoiding diving into the topic of dynamic linker at the moment. Not sure how long I can keep putting it off.
+
+### `newfstat()`
+
+`newfstatat(3, "", {st_mode=S_IFREG|0644, st_size=73663, ...}, AT_EMPTY_PATH) = 0`
+
+Note that this syscall is using the value `3` returned by `openat()` call before. `openat()` returns a file descriptor.
+
+`man newfstatat` opens the man page for `stat()`, which serves as the man page for `stat`, `fstat`, `lstat`, and 
+`fstatat`. All of these functions return information about a file. They return this in a buffer pointed to by `statbuf`.
+
+Signature of `fstatat` from the man page:
+```c
+int fstatat(int dirfd, const char *restrict pathname,
+        struct stat *restrict statbuf, int flags);
+```
+
+Comparing the call we see in `strace` output with the signature above, we can deduce that:
+
+* `3` corresponds to `int dirfd`,
+* `"""` to `const char *restrict pathname`,
+* `{st_mode=S_IFREG|0644, st_size=73663, ...}` to `struct stat *restrict statbuf`, and
+* `AT_EMPTY_PATH` to `int flags`.
+
+The `pathname`, which is an empty string `""`, and the flag `AT_EMPTY_PATH` instruct `fstatat` to operate on the 
+file pointed to by `dirfd`, which in this case is the file descriptor `3` returned by `openat()` call above. So the 
+`newfstatat` system call here is going to fetch and return the information about the file `/etc/ld.so.cache`.
+
+The struct `statbuf` passed as the argument is where the file information fetched by `fstatat` is being put (or 
+returned.) The `st_mode` field of the struct is a bitwise OR Of `S_IFREG` (from `man 7 inode`, is it a regular file?)
+and `0644` (which in this case is the permission on the `/etc/ld.so.cache` file), while `st_size` is the size in 
+bytes of the file:
+
+```shell
+$ ls -l /etc/ld.so.cache
+-rw-r--r--. 1 root root 73663 Feb  5 11:18 /etc/ld.so.cache
+```
+
+Finally, the integer return value 0 at the end indicates that the call was successful.
+
+### `mmap()`
+
+`mmap(NULL, 73663, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7f390c248000`
+
+`mmap()` again.
+
+The function signature from the man page:
+
+```c
+void *mmap(void *addr, size_t length, int prot, int flags,
+          int fd, off_t offset);
+```
+
+`NULL` indicates that the kernel chooses the address in the memory where it creates the mapping. It is the most 
+portable way of creating a new memory mapping.
+
+The value `73663` is the length of the mapping to be created. Here, it's 73663 bytes which is the size of the file 
+`/etc/ld.so.cache` as the mapping is being created for this file.
+
+`PROT_READ` is the desired memory protection of the mapping. `PROT_READ` indicates that the pages may be read.
+
+`MAP_PRIVATE` flag indicates that the changes made to the file are not copied back to the file on the disk. Those 
+changes stay in the mapped memory only. Other processes mapping the same file can't see the changes either.
+
+`3` once again points to the `/etc/ld.so.cache` file.
+
+`0` is the value for the offset. It's the starting position in the file referred to by the file descriptor.
+
+The return value `0x7f390c248000` is the pointer to the mapped area where the file `/etc/ld.so.cache` was mapped by 
+this call.
+
+### `close()`
+
+`close(3)                                = 0`
+
+This call closes the file descriptor. Here, the file `/etc/ld.so.cache` that we had opened for reading, has now been 
+closed. Return value of `0` indicates success in closing the file descriptor.
