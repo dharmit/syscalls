@@ -180,7 +180,10 @@ that the topic of "preloading" seemed like a rabbit hole that I don't want to di
 <!-- Why does `cat` need to read `/etc/ld.so.cache` file> -->
 `openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3`
 
-Signature of `openat` from the man page: `int openat(int dirfd, const char *pathname, int flags)`.
+Signature of `openat` from the man page: 
+```c
+int openat(int dirfd, const char *pathname, int flags)
+```
 
 Here, `/etc/ld.so.cache` file is being opened with the bitwise OR result of the flags (access modes) `O_RDONLY` 
 (read-only) and `O_CLOEXEC` (enable close-on-exec for the file descriptor). The `AT_FDCWD` parameter is ignored here 
@@ -265,5 +268,51 @@ this call.
 
 `close(3)                                = 0`
 
-This call closes the file descriptor. Here, the file `/etc/ld.so.cache` that we had opened for reading, has now been 
-closed. Return value of `0` indicates success in closing the file descriptor.
+This is a simple one. It closes the file descriptor. Here, the file `/etc/ld.so.cache` has now been closed. A return 
+value of `0` indicates success in closing the file descriptor.
+
+### `openat()`
+
+`openat(AT_FDCWD, "/lib64/libc.so.6", O_RDONLY|O_CLOEXEC) = 3`
+
+Exactly similar call as the previous `openat` call except for a different file.
+
+### `read()`
+
+`read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\320v\2\0\0\0\0\0"..., 832) = 832`
+
+This one took longer to grasp than I expected, and I'm not sure if I understood it completely. I decided not to dig 
+into the ELF (Executable and Linkable Format) for the time being, but I guess I'll have to start reading it sooner 
+rather than later.
+
+Anyway, back to the call we see here. Signature from the man page:
+```c
+ssize_t read(int fd, void *buf, size_t count);
+```
+Comparing the call from `strace` output with the signature:
+* `3` is the file descriptor supposed to be read. We got this from the `openat` call above.
+* `"\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\320v\2\0\0\0\0\0"...` is the interesting and confusing part. It's 
+the buffer into which `read()` attempts to read up to count bytes.
+* `832` is the count of bytes we want to read and the `832` we see being returned the bytes read by the call. That is, 
+it was able to read all the requested bytes.
+
+`"\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\320v\2\0\0\0\0\0"...` is the content of the file being read. Trying 
+to open `lib64/libc.so.6` will show a whole lot of gibberish because it's a binary file. A better way to read its 
+contents is:
+```shell
+$ od -bc /lib64/libc.so.6 | head
+```
+To dig more into this, looks this [stackoverflow answer](https://stackoverflow.com/a/58049206/395670).
+
+### `pread()`
+
+`pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 784, 64) = 784`
+
+The function signature from man page:
+```c
+ssize_t pread(int fd, void *buf, size_t count, off_t offset);
+```
+
+The signature is quite similar to that of `read()` call above. I see only one extra parameter here - `off_t offset`. 
+`pread` reads up to `784` bytes from the file descriptor `3` at offset `64` from the start of the file into the 
+buffer. Return value `784` is the number of bytes read. 
