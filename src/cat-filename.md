@@ -316,3 +316,104 @@ ssize_t pread(int fd, void *buf, size_t count, off_t offset);
 The signature is quite similar to that of `read()` call above. I see only one extra parameter here - `off_t offset`. 
 `pread` reads up to `784` bytes from the file descriptor `3` at offset `64` from the start of the file into the 
 buffer. Return value `784` is the number of bytes read. 
+
+### `newfstatat()`
+
+`newfstatat(3, "", {st_mode=S_IFREG|0755, st_size=2224288, ...}, AT_EMPTY_PATH) = 0`
+
+Similar call as earlier, but for a different file. As can be seen from below output, permissions on the file
+translate to `0755` and its size is 2224288 bytes:
+
+```shell
+$ ls -l /lib64/libc.so.6
+-rwxr-xr-x. 1 root root 2224288 Jan 11 18:44 /lib64/libc.so.6
+```
+
+### `pread()`
+
+<!-- TODO: find out why exact same `pread64` call happened twice -->
+`pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 784, 64) = 784`
+
+Looks to me like exactly same `pread` call as earlier. I'm not sure why the same call for the same file is repeating.
+
+### Bunch of `mmap()`s
+
+Next up, there are four `mmap()` calls. I'll explore them in one go.
+
+`mmap(NULL, 1953104, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7f390c06b000`
+
+This call creates a memory map of size 1953104 bytes for the file descriptor `3` (which points to `/lib64/libc.so.6`.
+) The `MAP_DENYWRITE` flag, according to the man page, is ignored. `0x7f390c06b000` is the pointer to the mapped 
+area created for the file.
+
+<!-- TODO: find answers to below questions -->
+What I don't understand here is the requested size of the map. The size of the file is 2224288 but that of the map 
+is 1953104. The value of offset in the call is 0, which is the beginning of the file. Why is the requested size 
+smaller than file size? How does it know that it only needs a mapping for the first 1953104 bytes?
+
+`mmap(0x7f390c091000, 1400832, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x26000) = 0x7f390c091000`
+
+This call asks the kernel to create a new memory map of size 1400832 bytes starting at address `0x7f390c091000` for 
+the same file descriptor as earlier, but starting at the offset value of `0x26000`.
+
+When an address is specified in the `mmap()` call, the kernel takes it as a hint about where to place the mapping. 
+If another mapping already exists there, kernel will place the memory map at a different address. In this particular 
+case, the return value of `mmap` is same as the address provided in the first argument; so, the kernel successfully 
+created a memory map at the address passed as hint. But this was mostly because of the `MAP_FIXED` flag which indicates 
+that the address should not be considered as a hint, but the memory mapping should be placed at that exact address. 
+More like an order rather than a request, if you will.
+
+`PROT_EXEC`, from the man page, indicates that the pages maybe executed. 
+[GNU documentation for libc](https://www.gnu.org/software/libc/manual/html_node/Memory-Protection.html) explains this a 
+bit further. This memory protection indicates that memory can be used to store instructions which can then be executed.
+
+`mmap(0x7f390c1e7000, 339968, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x17c000) = 0x7f390c1e7000`
+
+Similar call as the one earlier, with different values for address, size in bytes, and offset. Similar result as the 
+earlier call.
+
+`mmap(0x7f390c23a000, 24576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1ce000) = 0x7f390c23a000`
+
+One difference from the earlier two calls - it uses `PROT_WRITE`, which indicates that the mapped area could be 
+written to.
+
+`mmap(0x7f390c240000, 32080, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x7f390c240000`
+
+Since this `mmap()` call appears in a sequence of calls being made with file descriptor value `3`, it's easy to 
+overlook that this call is not being made for any specific file. It's requesting an anonymous map which, from the 
+stackoverflow answer [I linked earlier](https://stackoverflow.com/a/39903701/395670), can be meant for different 
+purposes. In the earlier call, I felt confident (and I could be wrong) that it was meant for extending the heap. In 
+this case, I'm not so confident, and it could be for any of the reasons mentioned in the answer.
+
+### `close()`
+
+`close(3)                                = 0`
+
+Same as earlier call to `close()`.
+
+### `mmap()`
+
+`mmap(NULL, 12288, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f390c068000`
+
+So many calls to `mmap()`! In fact, it's the most called syscall in the output.
+
+This call is very similar to the previous `mmap()` call except that it uses `NULL` instead of a specific address in 
+the memory (and, hence, doesn't use `MAP_FIXED` either). I wonder what this call is _exactly_ for.
+
+### `arch_prctl()`
+
+`arch_prctl(ARCH_SET_FS, 0x7f390c068740) = 0`
+
+A successful call this time, unlike the previous erroneous call.
+
+This call sets the value of 64-bit base for FS register to `0x7f390c068740`. I'm not entirely sure what that means. 
+This goes deeper than I am trying to dive into in this book. Yet, I spent a good amount of time trying to understand 
+the FS and GS registers. My takeaway at the moment is that they are segment registers, and that FS is used for
+[Thread Local Storage](https://www.kernel.org/doc/html/latest/x86/x86_64/fsgs.html#common-fs-and-gs-usage).
+
+So, here, it seems to be used to store an address into the FS register. Maybe it's storing the value that's stored 
+on that address, I'm not sure.
+
+### `set_tid_address()`
+
+`set_tid_address(0x7f390c068a10)         = 23150`
