@@ -8,8 +8,9 @@ $ cat filename
 Hello, world
 ```
 
-Now the `strace`:
-<!-- TODO: figure out how to fold strace output -->
+Now the `strace` output.
+<details><summary><code>strace cat filename</code>:</summary>
+
 ```shell
 $ strace cat filename
 execve("/usr/bin/cat", ["cat", "filename"], 0x7ffe36b26958 /* 62 vars */) = 0
@@ -65,6 +66,8 @@ close(2)                                = 0
 exit_group(0)                           = ?
 +++ exited with 0 +++
 ```
+
+</details>
 
 Let's start from the first line in the `strace` output and go all the way to the last one.
 
@@ -417,3 +420,264 @@ on that address, I'm not sure.
 ### `set_tid_address()`
 
 `set_tid_address(0x7f390c068a10)         = 23150`
+
+This call, according to the man page, sets pointer to thread ID. For each thread, the kernel maintains two 
+attributes (addresses) called `set_child_tid` and `clear_child_tid` which are set to `NULL` by default. The 
+`set_tid_address()` system call sets the `clear_child_tid` value for calling thread to the tid pointer. Now, when a 
+thread whose `clear_child_tid` is not NULL terminates, then, if the thread is sharing memory with other threads, 0 
+is written at the address specified in `clear_child_tid` and the kernel performs a `futex()` call. This call wakes 
+up a single thread that is performing futex wait on the memory location[^1].
+
+The value `23150` that is being returned by the call is the caller's thread ID.
+
+### `set_robust_list()`
+
+`set_robust_list(0x7f390c068a20, 24)     = 0`
+
+This system call deals with the per-thread robust futex lists. These lists are managed in the user space, the kernel 
+only has the location of the head of the list. The purpose of the robust futex list is to ensure that if a thread 
+accidentally fails to unlock a futex before terminating or calling `execve()`, another thread that is waiting on 
+that futex is notified that the former owner of the futex has died[^1].
+
+### `rseq()`
+
+`rseq(0x7f390c069060, 0x20, 0, 0x53053053) = 0`
+
+There's no man page for this on my Fedora 37 system. Looking around on the Internet, I found a lot of information 
+about it. A few interesting links - [1](https://criu.org/Rseq),
+[2](https://www.efficios.com/blog/2019/02/08/linux-restartable-sequences/),
+[3](https://kib.kiev.ua/kib/rseq.pdf). However, it was difficult for me to dive deeper into this without it turning 
+into a rabbit hole. I prefer finishing this strace journey that I have started for `cat filename` first.
+
+So, from the third link above, I found below signature:
+```c
+int rseq(struct rseq *rseq, uint32_t rseq_len, int flags, uint32_t sig);
+```
+
+`rseq` stands for "restartable sequences". It is a sequence of instructions guaranteed to be run atomically with 
+respect to other threads and signal handlers on the current CPU. If its execution doesn't finish atomically, the 
+kernel changes the execution flow by jumping to an abort handler defined by userspace for that sequence.
+
+In the function signature for `rseq()` system call, `rseq` argument (`*rseq`) is a pointer to the thread-local 
+`rseq` structure (`struct rseq`) to be shared between kernel and userspace. This structure contains many things 
+including `start_ip` which is the instruction pointer address of the first instruction in the sequence of 
+consecutive assembly instructions, and `abort_ip` which is the instruction pointer address of where to move the 
+execution flow in case of abort of the sequence pointed by `start_ip`[^2]. 
+
+### Bunch of `mprotect()`s
+
+`mprotect(0x7f390c23a000, 16384, PROT_READ) = 0`
+
+`mprotect()` sets a protection on a region of the memory. Function signature from the man page:
+```c
+int mprotect(void *addr, size_t len, int prot);
+```
+
+`mprotect()` changes the access protections for the calling process's memory pages in the address range [`addr`,
+`addr`+`len`-1]. Trying to access memory in a manner that violates the protections causes the kernel to raise 
+`SIGSEGV` signal for the process.
+
+`PROT_READ` indicates that the memory for which access protections are being changed can be read.
+
+In this case, the value for `*addr` is `0x7f390c23a000` which we saw in an earlier `mmap` call:
+```c
+mmap(0x7f390c23a000, 24576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1ce000) = 0x7f390c23a000
+```
+`mmap()` created it with `PROT_READ` and `PROT_WRITE` protection. So this particular `mprotect` call is changing the 
+protection for first 16384 bytes of it to `PROT_READ`.
+
+Next two `mprotect()` calls in the sequence do the same but for a different memory region. 0 return value for all 
+three calls indicates a successful execution.
+
+### `prlimit64()`
+
+`prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8192*1024, rlim_max=RLIM64_INFINITY}) = 0`
+
+`prlimit()` can be used to get and set resource limits of an arbitrart process.
+
+Function signature from the man page:
+```c
+int prlimit(pid_t pid, int resource, const struct rlimit *new_limit,
+           struct rlimit *old_limit);
+```
+
+* The value `0` for `pid` indicates that request is for the calling process.
+* `RLIMIT_STACK` is the maximum size of the process stack in bytes. Upon reaching this limit, a `SIGSEGV` signal is 
+  generated
+* Setting `NULL` for `*new_limit` looks common, but I don't understand why this limit is `NULL` while `*old_limit` 
+  has a non `NULL` value.
+* Setting `*old_limit` to a non `NULL` value places previous hard and soft limit for resource (here `RLIMIT_STACK`) 
+  in the `rlimit` structure pointed to by `old_limit`.
+
+### `munmap()`
+
+`munmap(0x7f390c248000, 73663)           = 0`
+
+`munmap()` is the opposite of `mmap()`. Here's the function signature:
+```c
+int munmap(void *addr, size_t length);
+```
+
+`munmap()` deletes the mappings for the specified address range. Here the address is `0x7f390c248000` and range is 
+the length which is 73663 bytes.
+
+Subsequent references to the pages which are successfully unmapped will generate `SIGSEGV`. However, it is not an 
+error of the indicated range doesn't contain any mapped pages in the first place.
+
+### `getrandom()`
+
+`getrandom("\x2a\xcf\xe3\x91\x15\x16\xe5\x39", 8, GRND_NONBLOCK) = 8`
+
+`getrandom()` helps obtain a series of random bytes. Function signature:
+```c
+ssize_t getrandom(void *buf, size_t buflen, unsigned int flags);
+```
+
+`getrandom()` generates random bytes of length `buflen` (in this call `buflen` is 8), and puts it into the buffer 
+pointed by `*buf`. The `GRND_NONBLOCK` flag indicates a non-blocking operation that doesn't block if no random bytes 
+are available; or, if using urandom source (same source as `/dev/random` device), it doesn't block if the entropy 
+pool hasn't been initialized. The return value 8 indicates the bytes that were copied to the buffer.
+
+### Couple of `brk()`s
+
+`brk(NULL)                               = 0x5651e8f08000`
+
+Same functionality as the earlier [`brk()`](#brk).
+
+`brk(0x5651e8f29000)                     = 0x5651e8f29000`
+
+This call changes the location of [program break](https://stackoverflow.com/a/6338195/395670) to the specified 
+address - in this case `0x5651e8f29000`.
+
+### `openat()`
+
+`openat(AT_FDCWD, "/usr/lib/locale/locale-archive", O_RDONLY|O_CLOEXEC) = 3`
+
+Same as [`openat()`](#openat) call earlier but for `/usr/lib/locale/locale-archive`.
+
+### `newfstatat()`
+
+`newfstatat(3, "", {st_mode=S_IFREG|0644, st_size=224104272, ...}, AT_EMPTY_PATH) = 0`
+
+Same as [`newfstatat()`](#newfstat) call earlier.
+
+### `mmap()`
+
+`mmap(NULL, 224104272, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7f38fea00000`
+
+Same as the second [`mmap()`](#mmap-1) call except that for a different file (even the file descriptor value is same.)
+
+### `close()`
+
+`close(3)                                = 0`
+
+Should be quite familiar by now.
+
+### `newfstatat()`
+
+`newfstatat(1, "", {st_mode=S_IFCHR|0620, st_rdev=makedev(0x88, 0), ...}, AT_EMPTY_PATH) = 0`
+
+The `dirfd` value here is `1` which is the `stdout`. This is where we expect the output of our `cat` command to show 
+up. Empty value for `PATHNAME` and the flag value `AT_EMPTY_PATH` ask `newfstatat` to operate on file referred by 
+`dirfd` - here `stdout`. The `statbuf` value is different from previous calls. `S_IFCHR` is for a character device. 
+And the return value of `makedev(0x88,0)` is set as the value for `st_rdev`. Values `0x88` and `0` passed to 
+`makedev` are major ID and minor ID of the device respectively.
+
+### openat(AT_FDCWD, "filename", O_RDONLY)  = 3
+
+At last the `open()` call for the file we want to display the contents of! Same as previous `openat()` calls but 
+only the `O_RDONLY` flag.
+
+### newfstatat(3, "", {st_mode=S_IFREG|0644, st_size=13, ...}, AT_EMPTY_PATH) = 0
+
+Same as the [`newfstatat()`](#newfstat) call earlier.
+
+### `fadvise()`
+
+`fadvise64(3, 0, 0, POSIX_FADV_SEQUENTIAL) = 0`
+
+Function signature:
+```c
+int posix_fadvise(int fd, off_t offset, off_t len, int advice);
+```
+
+`fadvise()` is used by programs to announce an intention to access file data in specific pattern in future. This 
+allows the kernel to do necessary optimizations.
+
+Here the advice is meant for the file descriptor 3 starting at offset 0 (beginning of the file). Setting 0 for `len` 
+means till end of the file. The advice is not a binding; it's only an expectation of the application. 
+`POSIX_FADV_SEQUENTIAL` advice indicates that the application expects to access the data in the file sequentially.
+
+### `mmap()`
+
+`mmap(NULL, 139264, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f390c046000`
+
+Same as the first [`mmap()`](#mmap) call except that for a different file (even the file descriptor value is same.)
+
+### `read()`
+
+`read(3, "hello, world\n", 131072)       = 13`
+
+Same as earlie `read()` calls. But I'm not sure about the significance of the number 131072. It translates to 128KB. 
+I'm not sure if that means anything.
+
+### `write()` 
+
+`write(1, "hello, world\n", 13hello, world)          = 13`
+
+Function signature from the man page:
+```c
+ssize_t write(int fd, const void *buf, size_t count);
+```
+
+Comparing the call wee see in `strace` output with the signature above:
+* `1` (which represents stdout in this case) is the file descriptor where it will write,
+* `"hello, world\n"` is the data in the buffer, and
+* `13hello, world` is two parts:
+  * `13` is the count of bytes
+  * `hello, world` is the output of our `cat filename` command. If you note closely, it also causes a newline to be 
+    printed and hence the closing parenthesis `)` appears on the next line, and so does the return value of the 
+    `write()` system call which is `13` in this case. It represents the number of bytes written by the call.
+
+
+### `read()`
+
+`read(3, "", 131072)                     = 0`
+
+I sure understand this call by now, but don't understand its significance at this point in the flow of our `cat` 
+command.
+
+### `munmap()`
+
+`munmap(0x7f390c046000, 139264)          = 0`
+
+As pointed earlier, `munmap()` deletes the mappings for specified address range. Here the mentioned address is same 
+as that returned by most recent `mmap()` call which was executed for the file `filename`. So this call is deleting 
+the mappings created for `filename`.
+
+### Bunch of `close()`s
+```
+close(3)                                = 0
+close(1)                                = 0
+close(2)                                = 0
+```
+
+Closing the various file descriptors.
+
+### `exit_group()`
+
+`exit_group(0)                           = ?`
+
+Function signature from the man page:
+```c
+noreturn void syscall(SYS_exit_group, int status);
+```
+
+This system call terminates all threads in a process. It doesn't return anything.
+
+[^1]: Most of the explanation here is exactly as-is in the man page. That's because it was the best explanation I 
+found.
+
+[^2]: I have tried to simplify things instead of being accurate. To be accurate `abort_ip` and `start_ip` are the 
+fields of the `rseq_cs` structure, which is one of the fields of the `struct rseq`. For accurate and detailed 
+information, please refer [this](https://kib.kiev.ua/kib/rseq.pdf).
