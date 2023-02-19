@@ -76,15 +76,13 @@ Let's start from the first line in the `strace` output and go all the way to the
 `execve("/usr/bin/cat", ["cat", "filename"], 0x7ffe36b26958 /* 62 vars */) = 0`
 
 From the man page (`man 2 execve`), `execve` stands for "execute program", and here's the function's signature (from 
-man page's `SYNOPSIS` section):
+its man page's `SYNOPSIS` section):
 ```c
-#include <unistd.h>
-
 int execve(const char *pathname, char *const argv[],
           char *const envp[]);
 ```
 
-Comparing the `strace` output above with the function signature, we can deduce that:
+Comparing the `strace` earlier output above with the function signature above, we can deduce that:
 
 * `/usr/bin/cat` corresponds to `const char *pathname`,
 * `["cat", "filename"]` to `char *const argv[]`, and
@@ -95,10 +93,10 @@ Comparing the `strace` output above with the function signature, we can deduce t
 `pathname` should either be an executable binary or a script starting with a line that looks like `#!<interpreter>`, 
 e.g., a shell script that starts with `#!/bin/bash`.
 
-`argv` is an array of pointers to strings passed to the new program as its arguments. By convention, the first string 
-(`argv[0]`) contains the filename associated with the program being executed; so it's `cat` in this case. I wonder 
-if this could be a different name, or it's something that's not allowed. I tried below, but aliasing doesn't seem to 
-work on aliases:
+`argv` is an array of arguments passed to the new program. By convention, the first string (`argv[0]`) contains the 
+filename associated with the program being executed; so it's `cat` in this case. Since it's a convention (not a 
+mandate) I wonder if this could be a different name than the name of the program. I tried below, but aliasing 
+doesn't seem to work on aliases:
 
 ```shell
 $ alias somecat=cat
@@ -127,8 +125,8 @@ comments and answers on stackexchange network sites suggest that `brk` and `sbrk
 
 `brk(NULL)`, as it is being called here, returns the address of the memory where the 
 [heap memory](https://dharmitshah.com/2022/09/stack-heap-go/) (the portion of the memory corresponding to dynamic 
-memory allocations) ends. In this case, I think, the value `0x5651e8f08000` we see at the end of that line is the 
-memory address where the heap memory ends.
+memory allocations) ends. In this case the value `0x5651e8f08000` we see at the end of that line is the memory 
+address where the heap memory ends.
 
 This system call is usually called right before `malloc()` or another call that makes use of `malloc()` internally.
 
@@ -143,9 +141,15 @@ value for the argument `code` is the one that is invalid.
 
 `mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f390c25a000`
 
-It took me some time to understand `mmap`. From the first statement of its man page:
+From its man page:
 ```shell
 mmap, munmap - map or unmap files or devices into memory
+```
+Function signature:
+
+```c
+void *mmap(void *addr, size_t length, int prot, int flags,
+          int fd, off_t offset);
 ```
 I thought it copies the file contents to the memory. But that's not the case.
 
@@ -153,19 +157,21 @@ In this particular call, `mmap` function creates a new mapping of the size 8192
 [bytes](https://www.geeksforgeeks.org/size_t-data-type-c-language/) in the virtual address space of the calling 
 process. The calling process here is `cat`.
 
-Using `mmap` doesn't actually read the file, but creates a mapping in the memory of the size of the file. However, 
-in this particular case, the value for `fd` (file descriptor) is -1. The value for the flags is bitwise OR of 
-`MAP_PRIVATE` and `MAP_ANONYMOUS`. It took me hours reading various answers and blogs on the Internet, and my final
-understanding is that this particular call is meant to 
-[increase the heap memory](https://stackoverflow.com/a/39903701/395670) by 8192 bytes. The return value 
-`0x7f390c25a000` is the pointer in the virtual memory to the area where this heap memory was created.
+Using `mmap` doesn't actually read the file, but creates a mapping of the size of the file in the memory. However, 
+in this particular case, the value for `fd` (file descriptor) is -1, which indicates that there's no specific file 
+for which mapping is to be created. And the flag `MAP_ANONYMOUS` indicates to create an anonymous mapping that's not 
+connected to any file. So this particular call is meant to 
+[grow the heap memory](https://stackoverflow.com/a/39903701/395670) by 8192 bytes. `NULL` argument lets the kernel 
+choose the location in memory where it wants to create the mapping.
 
-There are more calls to `mmap` in the output we're walking through, and I expect them to be doing different things. 
-Some useful links for mmap - [1](https://sasha-f.medium.com/why-mmap-is-faster-than-system-calls-24718e75ab37),
+The return value `0x7f390c25a000` is the pointer in the virtual memory to the area where this heap memory was created.
+
+Some useful links for mmap - 
+[1](https://sasha-f.medium.com/why-mmap-is-faster-than-system-calls-24718e75ab37),
 [2](https://stackoverflow.com/questions/1739296/malloc-vs-mmap-in-c),
-[3](https://unix.stackexchange.com/questions/389124/understanding-mmap). Phew!
+[3](https://unix.stackexchange.com/questions/389124/understanding-mmap).
 
-### `access`
+### `access()`
 
 `access("/etc/ld.so.preload", R_OK)      = -1 ENOENT (No such file or directory)`
 
@@ -176,14 +182,14 @@ my system. `R_OK` indicates read permissions.
 My curiosity led me to find more about `/etc/ld.so.preload`. First I did, `dnf provides` but it exited saying "No 
 packages found". Next, I went to the search engine which yielded Q&A across stackechange sites. Attempting 
 to open `/etc/ld.so.preload` is a behaviour all programs exhibit; it's something that's baked into glibc. Beyond 
-that the topic of "preloading" seemed like a rabbit hole that I don't want to dive into at the moment.
+that the topic of "preloading" seemed like a rabbit hole that I didn't want to dive into yet.
 
-### openat()
+### `openat()`
 
 <!-- Why does `cat` need to read `/etc/ld.so.cache` file> -->
 `openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3`
 
-Signature of `openat` from the man page: 
+Function signature: 
 ```c
 int openat(int dirfd, const char *pathname, int flags)
 ```
@@ -192,22 +198,19 @@ Here, `/etc/ld.so.cache` file is being opened with the bitwise OR result of the 
 (read-only) and `O_CLOEXEC` (enable close-on-exec for the file descriptor). The `AT_FDCWD` parameter is ignored here 
 because the filename is provided as an absolute path, not relative path. The returned value `3` is a file descriptor.
 This file descriptor is a small, non-negative integer that is an index to an entry in the process's table of open 
-file descriptors. That's a mouthful!
+file descriptors.
 
 You might notice that `/etc/ld.so.cache` is a binary file. To read its contents, use `ldconfig -p`. Its contents are 
-list of directories in which the dynamic linker would search for shared objects. Like with `access()` above, I'm 
-avoiding diving into the topic of dynamic linker at the moment. Not sure how long I can keep putting it off.
+list of directories in which the dynamic linker would search for shared objects.
 
 ### `newfstat()`
 
 `newfstatat(3, "", {st_mode=S_IFREG|0644, st_size=73663, ...}, AT_EMPTY_PATH) = 0`
 
-Note that this syscall is using the value `3` returned by `openat()` call before. `openat()` returns a file descriptor.
-
 `man newfstatat` opens the man page for `stat()`, which serves as the man page for `stat`, `fstat`, `lstat`, and 
 `fstatat`. All of these functions return information about a file. They return this in a buffer pointed to by `statbuf`.
 
-Signature of `fstatat` from the man page:
+Function signature:
 ```c
 int fstatat(int dirfd, const char *restrict pathname,
         struct stat *restrict statbuf, int flags);
@@ -215,7 +218,7 @@ int fstatat(int dirfd, const char *restrict pathname,
 
 Comparing the call we see in `strace` output with the signature above, we can deduce that:
 
-* `3` corresponds to `int dirfd`,
+* `3` corresponds to `int dirfd`; it is using the value `3` returned by `openat()` call before.,
 * `"""` to `const char *restrict pathname`,
 * `{st_mode=S_IFREG|0644, st_size=73663, ...}` to `struct stat *restrict statbuf`, and
 * `AT_EMPTY_PATH` to `int flags`.
@@ -240,20 +243,11 @@ Finally, the integer return value 0 at the end indicates that the call was succe
 
 `mmap(NULL, 73663, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7f390c248000`
 
-`mmap()` again.
-
-The function signature from the man page:
-
-```c
-void *mmap(void *addr, size_t length, int prot, int flags,
-          int fd, off_t offset);
-```
-
-`NULL` indicates that the kernel chooses the address in the memory where it creates the mapping. It is the most 
+`NULL` indicates that the kernel should choose the address in the memory where it creates the mapping. It is the most 
 portable way of creating a new memory mapping.
 
 The value `73663` is the length of the mapping to be created. Here, it's 73663 bytes which is the size of the file 
-`/etc/ld.so.cache` as the mapping is being created for this file.
+`/etc/ld.so.cache`, as the mapping is being created for this file.
 
 `PROT_READ` is the desired memory protection of the mapping. `PROT_READ` indicates that the pages may be read.
 
@@ -271,24 +265,20 @@ this call.
 
 `close(3)                                = 0`
 
-This is a simple one. It closes the file descriptor. Here, the file `/etc/ld.so.cache` has now been closed. A return 
-value of `0` indicates success in closing the file descriptor.
+It closes the file descriptor. Here, the file `/etc/ld.so.cache` has now been closed. A return value of `0` 
+indicates success in closing the file descriptor.
 
 ### `openat()`
 
 `openat(AT_FDCWD, "/lib64/libc.so.6", O_RDONLY|O_CLOEXEC) = 3`
 
-Exactly similar call as the previous `openat` call except for a different file.
+Exactly similar call as the previous `openat()` call except for a different file.
 
 ### `read()`
 
 `read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\320v\2\0\0\0\0\0"..., 832) = 832`
 
-This one took longer to grasp than I expected, and I'm not sure if I understood it completely. I decided not to dig 
-into the ELF (Executable and Linkable Format) for the time being, but I guess I'll have to start reading it sooner 
-rather than later.
-
-Anyway, back to the call we see here. Signature from the man page:
+Function signature:
 ```c
 ssize_t read(int fd, void *buf, size_t count);
 ```
@@ -300,7 +290,7 @@ the buffer into which `read()` attempts to read up to count bytes.
 it was able to read all the requested bytes.
 
 `"\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\320v\2\0\0\0\0\0"...` is the content of the file being read. Trying 
-to open `lib64/libc.so.6` will show a whole lot of gibberish because it's a binary file. A better way to read its 
+to open `lib64/libc.so.6` will seem a lot of gibberish because it's a binary file. A better way to read its 
 contents is:
 ```shell
 $ od -bc /lib64/libc.so.6 | head
@@ -311,12 +301,12 @@ To dig more into this, looks this [stackoverflow answer](https://stackoverflow.c
 
 `pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 784, 64) = 784`
 
-The function signature from man page:
+Function signature:
 ```c
 ssize_t pread(int fd, void *buf, size_t count, off_t offset);
 ```
 
-The signature is quite similar to that of `read()` call above. I see only one extra parameter here - `off_t offset`. 
+The signature is quite similar to that of `read()` call above. There's one extra parameter here - `off_t offset`. 
 `pread` reads up to `784` bytes from the file descriptor `3` at offset `64` from the start of the file into the 
 buffer. Return value `784` is the number of bytes read. 
 
@@ -337,56 +327,60 @@ $ ls -l /lib64/libc.so.6
 <!-- TODO: find out why exact same `pread64` call happened twice -->
 `pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 784, 64) = 784`
 
-Looks to me like exactly same `pread` call as earlier. I'm not sure why the same call for the same file is repeating.
+Looks like exactly same `pread` call as earlier. I'm not sure why the same call for the same file is repeating.
 
 ### Bunch of `mmap()`s
 
-Next up, there are four `mmap()` calls. I'll explore them in one go.
+Next up, there are five `mmap()` calls.
 
-`mmap(NULL, 1953104, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7f390c06b000`
+1. `mmap(NULL, 1953104, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7f390c06b000`
 
-This call creates a memory map of size 1953104 bytes for the file descriptor `3` (which points to `/lib64/libc.so.6`.
-) The `MAP_DENYWRITE` flag, according to the man page, is ignored. `0x7f390c06b000` is the pointer to the mapped 
-area created for the file.
+   This call creates a memory map of size 1953104 bytes for the file descriptor `3` (which points to `/lib64/libc.
+   so.6`.) The `MAP_DENYWRITE` flag, according to the man page, is ignored. `0x7f390c06b000` is the pointer to the 
+   mapped area created for the file.
+    
+   <!-- TODO: find answers to below questions -->
+   What I don't understand here is the requested size of the map. The size of the file is 2224288 but that of the map 
+   is 1953104. The value of offset (position to start from) in the call is 0, which is the beginning of the file.
+   Why is the requested size smaller than file size? How does it know that it only needs a mapping for the first 
+   1953104 bytes?
 
-<!-- TODO: find answers to below questions -->
-What I don't understand here is the requested size of the map. The size of the file is 2224288 but that of the map 
-is 1953104. The value of offset in the call is 0, which is the beginning of the file. Why is the requested size 
-smaller than file size? How does it know that it only needs a mapping for the first 1953104 bytes?
+1. `mmap(0x7f390c091000, 1400832, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x26000) = 
+   0x7f390c091000`
 
-`mmap(0x7f390c091000, 1400832, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x26000) = 0x7f390c091000`
+    This call asks the kernel to create a new memory map of size 1400832 bytes starting at address `0x7f390c091000` for 
+    the same file descriptor as earlier, but starting at the offset value of `0x26000`.
+    
+    When an address is specified in the `mmap()` call, the kernel takes it as a hint about where to place the mapping. 
+    If another mapping already exists there, kernel will place the memory map at a different address. In this particular 
+    case, the return value of `mmap` is same as the address provided in the first argument; so, the kernel successfully 
+    created a memory map at the address passed as hint. But this was mostly because of the `MAP_FIXED` flag which 
+    indicates that the starting address (in this call `0x7f390c091000` should not be considered as a hint, but the 
+    memory mapping should be placed at that exact address. More like an order rather than a request, if you will.
+    
+    `PROT_EXEC` indicates that the pages maybe executed.
+    [GNU documentation for libc](https://www.gnu.org/software/libc/manual/html_node/Memory-Protection.html) explains 
+    this a bit further. This memory protection indicates that memory can be used to store instructions which can then 
+    be executed.
 
-This call asks the kernel to create a new memory map of size 1400832 bytes starting at address `0x7f390c091000` for 
-the same file descriptor as earlier, but starting at the offset value of `0x26000`.
+1. `mmap(0x7f390c1e7000, 339968, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x17c000) = 0x7f390c1e7000`
 
-When an address is specified in the `mmap()` call, the kernel takes it as a hint about where to place the mapping. 
-If another mapping already exists there, kernel will place the memory map at a different address. In this particular 
-case, the return value of `mmap` is same as the address provided in the first argument; so, the kernel successfully 
-created a memory map at the address passed as hint. But this was mostly because of the `MAP_FIXED` flag which indicates 
-that the address should not be considered as a hint, but the memory mapping should be placed at that exact address. 
-More like an order rather than a request, if you will.
+    Similar call as the one earlier with different values for address, size in bytes, and offset. Similar result as the 
+    earlier call.
 
-`PROT_EXEC`, from the man page, indicates that the pages maybe executed. 
-[GNU documentation for libc](https://www.gnu.org/software/libc/manual/html_node/Memory-Protection.html) explains this a 
-bit further. This memory protection indicates that memory can be used to store instructions which can then be executed.
+1. `mmap(0x7f390c23a000, 24576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1ce000) = 
+   0x7f390c23a000`
 
-`mmap(0x7f390c1e7000, 339968, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x17c000) = 0x7f390c1e7000`
+    One difference from the earlier two calls - it uses `PROT_WRITE`, which indicates that the mapped area could be 
+    written to.
 
-Similar call as the one earlier, with different values for address, size in bytes, and offset. Similar result as the 
-earlier call.
+1. `mmap(0x7f390c240000, 32080, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x7f390c240000`
 
-`mmap(0x7f390c23a000, 24576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1ce000) = 0x7f390c23a000`
-
-One difference from the earlier two calls - it uses `PROT_WRITE`, which indicates that the mapped area could be 
-written to.
-
-`mmap(0x7f390c240000, 32080, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x7f390c240000`
-
-Since this `mmap()` call appears in a sequence of calls being made with file descriptor value `3`, it's easy to 
-overlook that this call is not being made for any specific file. It's requesting an anonymous map which, from the 
-stackoverflow answer [I linked earlier](https://stackoverflow.com/a/39903701/395670), can be meant for different 
-purposes. In the earlier call, I felt confident (and I could be wrong) that it was meant for extending the heap. In 
-this case, I'm not so confident, and it could be for any of the reasons mentioned in the answer.
+    Since this `mmap()` call appears in a sequence of calls being made with file descriptor value `3`, it's easy to 
+    overlook that this call is not being made for any specific file. It's requesting an anonymous map which, from the 
+    stackoverflow answer [I linked earlier](https://stackoverflow.com/a/39903701/395670), can be meant for different 
+    purposes. In the earlier call it was meant to grow the heap. In this case, I'm not so confident. It could be 
+    for any of the reasons mentioned in the answer.
 
 ### `close()`
 
@@ -401,7 +395,7 @@ Same as earlier call to `close()`.
 So many calls to `mmap()`! In fact, it's the most called syscall in the output.
 
 This call is very similar to the previous `mmap()` call except that it uses `NULL` instead of a specific address in 
-the memory (and, hence, doesn't use `MAP_FIXED` either). I wonder what this call is _exactly_ for.
+the memory (and, hence, doesn't use `MAP_FIXED` either). This looks like a call to grow the heap size.
 
 ### `arch_prctl()`
 
@@ -410,8 +404,8 @@ the memory (and, hence, doesn't use `MAP_FIXED` either). I wonder what this call
 A successful call this time, unlike the previous erroneous call.
 
 This call sets the value of 64-bit base for FS register to `0x7f390c068740`. I'm not entirely sure what that means. 
-This goes deeper than I am trying to dive into in this book. Yet, I spent a good amount of time trying to understand 
-the FS and GS registers. My takeaway at the moment is that they are segment registers, and that FS is used for
+This goes deeper than I am trying to dive into. Yet, I spent a good amount of time trying to understand the FS and 
+GS registers. My takeaway, at the moment, is that they are segment registers, and that FS is used for
 [Thread Local Storage](https://www.kernel.org/doc/html/latest/x86/x86_64/fsgs.html#common-fs-and-gs-usage).
 
 So, here, it seems to be used to store an address into the FS register. Maybe it's storing the value that's stored 
@@ -421,12 +415,12 @@ on that address, I'm not sure.
 
 `set_tid_address(0x7f390c068a10)         = 23150`
 
-This call, according to the man page, sets pointer to thread ID. For each thread, the kernel maintains two 
-attributes (addresses) called `set_child_tid` and `clear_child_tid` which are set to `NULL` by default. The 
-`set_tid_address()` system call sets the `clear_child_tid` value for calling thread to the tid pointer. Now, when a 
-thread whose `clear_child_tid` is not NULL terminates, then, if the thread is sharing memory with other threads, 0 
-is written at the address specified in `clear_child_tid` and the kernel performs a `futex()` call. This call wakes 
-up a single thread that is performing futex wait on the memory location[^1].
+This call sets pointer to thread ID. For each thread, the kernel maintains two attributes (addresses) called 
+`set_child_tid` and `clear_child_tid` which are set to `NULL` by default. The `set_tid_address()` system call sets 
+the `clear_child_tid` value for calling thread to the tid pointer. Now, when a thread whose `clear_child_tid` is not 
+NULL terminates, then, if the thread is sharing memory with other threads, 0 is written at the address specified in 
+`clear_child_tid` and the kernel performs a `futex()` call. This call wakes up a single thread that is performing 
+futex wait on the memory location[^1].
 
 The value `23150` that is being returned by the call is the caller's thread ID.
 
@@ -446,10 +440,7 @@ that futex is notified that the former owner of the futex has died[^1].
 There's no man page for this on my Fedora 37 system. Looking around on the Internet, I found a lot of information 
 about it. A few interesting links - [1](https://criu.org/Rseq),
 [2](https://www.efficios.com/blog/2019/02/08/linux-restartable-sequences/),
-[3](https://kib.kiev.ua/kib/rseq.pdf). However, it was difficult for me to dive deeper into this without it turning 
-into a rabbit hole. I prefer finishing this strace journey that I have started for `cat filename` first.
-
-So, from the third link above, I found below signature:
+[3](https://kib.kiev.ua/kib/rseq.pdf). From the third link hee, I found below signature:
 ```c
 int rseq(struct rseq *rseq, uint32_t rseq_len, int flags, uint32_t sig);
 ```
@@ -493,9 +484,9 @@ three calls indicates a successful execution.
 
 `prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8192*1024, rlim_max=RLIM64_INFINITY}) = 0`
 
-`prlimit()` can be used to get and set resource limits of an arbitrart process.
+`prlimit()` can be used to get and set resource limits of an arbitrary process.
 
-Function signature from the man page:
+Function signature:
 ```c
 int prlimit(pid_t pid, int resource, const struct rlimit *new_limit,
            struct rlimit *old_limit);
@@ -618,14 +609,14 @@ Same as the first [`mmap()`](#mmap) call except that for a different file (even 
 
 `read(3, "hello, world\n", 131072)       = 13`
 
-Same as earlie `read()` calls. But I'm not sure about the significance of the number 131072. It translates to 128KB. 
+Same as earlier `read()` calls. But I'm not sure about the significance of the number 131072. It translates to 128KB. 
 I'm not sure if that means anything.
 
 ### `write()` 
 
 `write(1, "hello, world\n", 13hello, world)          = 13`
 
-Function signature from the man page:
+Function signature:
 ```c
 ssize_t write(int fd, const void *buf, size_t count);
 ```
@@ -674,6 +665,8 @@ noreturn void syscall(SYS_exit_group, int status);
 ```
 
 This system call terminates all threads in a process. It doesn't return anything.
+
+---
 
 [^1]: Most of the explanation here is exactly as-is in the man page. That's because it was the best explanation I 
 found.
